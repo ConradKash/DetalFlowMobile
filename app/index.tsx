@@ -145,7 +145,6 @@ export default function DentalAIScreen() {
         break;
 
       case 'status':
-        setStatus('🔍 ' + data.message);
         const systemMessage: SystemMessage = {
           type: 'system',
           message: data.message,
@@ -306,14 +305,11 @@ export default function DentalAIScreen() {
 
   return (
     <View style={styles.container}>
-      {/* Header */}
       <View style={styles.header}>
-        <Text style={styles.title}>Dental AI Assistant</Text>
-        <Text style={styles.subtitle}>Real-time dental condition analysis</Text>
+        <Text style={styles.title}>Dental Flow</Text>
       </View>
 
       <ScrollView style={styles.scrollView} showsVerticalScrollIndicator={false}>
-        {/* Camera Preview */}
         <View style={styles.cameraContainer}>
           <CameraView
             style={styles.camera}

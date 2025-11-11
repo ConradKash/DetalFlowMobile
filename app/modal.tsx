@@ -1,13 +1,15 @@
 import { CameraType, CameraView, useCameraPermissions } from 'expo-camera';
 import React, { useEffect, useRef, useState } from 'react';
 import {
+  AccessibilityInfo,
   Alert,
   Animated,
+  LogBox,
   ScrollView,
   StyleSheet,
   Text,
   TouchableOpacity,
-  View
+  View,
 } from 'react-native';
 
 const WS_SERVER_URL = 'ws://16.171.19.66:8000/ws/predict';
@@ -36,11 +38,13 @@ export default function DentalAIScreen() {
   const [currentPrediction, setCurrentPrediction] = useState<Prediction | null>(null);
   const [status, setStatus] = useState('🔄 Initializing...');
   const [isConnected, setIsConnected] = useState(false);
+  const [reduceMotionEnabled, setReduceMotionEnabled] = useState(false);
 
   const cameraRef = useRef<any>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const frameCountRef = useRef(0);
   const captureIntervalRef = useRef<number | null>(null);
+  const errorAlertShownRef = useRef(false);
   const confidenceAnim = useRef(new Animated.Value(0)).current;
 
   useEffect(() => {
@@ -51,14 +55,40 @@ export default function DentalAIScreen() {
   }, []);
 
   useEffect(() => {
-    if (currentPrediction) {
-      Animated.timing(confidenceAnim, {
-        toValue: currentPrediction.confidence,
-        duration: 500,
-        useNativeDriver: false,
-      }).start();
+    if (!currentPrediction) return;
+
+    // Respect OS reduced-motion accessibility setting. When enabled, jump to value instead
+    if (reduceMotionEnabled) {
+      confidenceAnim.setValue(currentPrediction.confidence);
+      return;
     }
-  }, [currentPrediction]);
+
+    Animated.timing(confidenceAnim, {
+      toValue: currentPrediction.confidence,
+      duration: 500,
+      useNativeDriver: false,
+    }).start();
+  }, [currentPrediction, reduceMotionEnabled]);
+
+  // Check OS reduced motion setting and silence the dev-only Reanimated warning
+  useEffect(() => {
+    // Silence the development-only Reanimated reduced-motion warning (optional)
+    LogBox.ignoreLogs([
+      '[Reanimated] Reduced motion setting is enabled on this device. This warning is visible only in the development mode. Some animations will be disabled by default.',
+    ]);
+
+    AccessibilityInfo.isReduceMotionEnabled().then(enabled => {
+      setReduceMotionEnabled(Boolean(enabled));
+    });
+
+    const sub: any = AccessibilityInfo.addEventListener?.('reduceMotionChanged', (enabled: boolean) => {
+      setReduceMotionEnabled(Boolean(enabled));
+    });
+
+    return () => {
+      if (sub && typeof sub.remove === 'function') sub.remove();
+    };
+  }, []);
 
   const connectWebSocket = () => {
     try {
@@ -98,7 +128,9 @@ export default function DentalAIScreen() {
   };
 
   const handleWebSocketMessage = (data: any) => {
-    switch (data.type) {
+  const msgType = (data.type || data.action || data.msg_type || '').toString().toLowerCase();
+
+  switch (msgType) {
       case 'prediction':
         const prediction: Prediction = {
           type: 'prediction',
@@ -122,13 +154,30 @@ export default function DentalAIScreen() {
         setChatHistory(prev => [...prev.slice(-11), systemMessage]);
         break;
 
+      case 'ack':
+        // server acknowledgements (frame acks) — ignore or surface briefly in status
+        if (data.frame_count) {
+          setStatus(`📡 Ack ${data.frame_count}`);
+        }
+        break;
+
       case 'error':
-        setStatus('❌ ' + data.message);
-        Alert.alert('Analysis Error', data.message);
+        setStatus('❌ ' + (data.message || 'Analysis error'));
+        const errMsg: SystemMessage = {
+          type: 'system',
+          message: data.message || 'Analysis error',
+          timestamp: new Date().toLocaleTimeString(),
+        };
+        setChatHistory(prev => [...prev.slice(-11), errMsg]);
+        // show alert only once per session to avoid repeated popups
+        if (!(errorAlertShownRef.current)) {
+          errorAlertShownRef.current = true;
+        }
         break;
 
       default:
-        console.log('Unknown message type:', data.type);
+        // don't spam the console for non-critical/unexpected messages; use debug for dev inspection
+        console.debug('Unhandled WS message type:', msgType, data);
     }
   };
 
@@ -337,10 +386,6 @@ export default function DentalAIScreen() {
           <Text style={styles.statsTitle}>📊 Live Stats</Text>
           <View style={styles.statsRow}>
             <View style={styles.statItem}>
-              <Text style={styles.statValue}>{totalPredictions}</Text>
-              <Text style={styles.statLabel}>Total Predictions</Text>
-            </View>
-            <View style={styles.statItem}>
               <Text style={styles.statValue}>
                 {currentPrediction ? formatClassName(currentPrediction.predicted_class) : '--'}
               </Text>
@@ -401,9 +446,7 @@ export default function DentalAIScreen() {
                       </Text>
                     </>
                   ) : (
-                    <Text style={styles.systemMessageText}>
-                      {message.message}
-                    </Text>
+                    <></>
                   )}
                 </View>
               ))
@@ -413,17 +456,6 @@ export default function DentalAIScreen() {
 
         {/* Information Section */}
         <View style={styles.infoContainer}>
-          <Text style={styles.infoTitle}>🦷 Common Conditions</Text>
-          <Text style={styles.infoText}>
-            • Cavities - Tooth decay{"\n"}
-            • Gum Disease - Inflammation{"\n"} 
-            • Plaque - Tartar buildup{"\n"}
-            • Ulcers - Mouth sores{"\n"}
-            • Stains - Discoloration{"\n"}
-            • Missing Teeth - Hypodontia{"\n"}
-            • Healthy - Normal teeth
-          </Text>
-
           <Text style={styles.infoTitle}>💡 Tips for Best Results</Text>
           <Text style={styles.infoText}>
             • Ensure good lighting{"\n"}
@@ -441,7 +473,7 @@ export default function DentalAIScreen() {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#f8f9fa',
+    backgroundColor: '#1bd4daff',
   },
   scrollView: {
     flex: 1,
@@ -462,7 +494,7 @@ const styles = StyleSheet.create({
   },
   subtitle: {
     fontSize: 16,
-    color: 'rgba(255,255,255,0.9)',
+    color: 'rgba(191, 32, 32, 0.9)',
     textAlign: 'center',
     marginTop: 4,
   },
@@ -479,7 +511,7 @@ const styles = StyleSheet.create({
   },
   camera: {
     width: '100%',
-    aspectRatio: 4/3,
+    aspectRatio: 4/6,
   },
   predictionOverlay: {
     position: 'absolute',
@@ -610,7 +642,7 @@ const styles = StyleSheet.create({
   },
   chatContainer: {
     margin: 16,
-    backgroundColor: 'white',
+    backgroundColor: '#16a855ff',
     borderRadius: 16,
     padding: 16,
     shadowColor: '#000',
@@ -646,7 +678,7 @@ const styles = StyleSheet.create({
     backgroundColor: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
   },
   systemMessage: {
-    backgroundColor: '#f8f9fa',
+    backgroundColor: '#a9b4c0ff',
     borderColor: '#e9ecef',
     borderWidth: 1,
   },
@@ -695,7 +727,7 @@ const styles = StyleSheet.create({
   },
   infoText: {
     fontSize: 14,
-    color: '#666',
+    color: '#4f2828ff',
     lineHeight: 20,
     marginBottom: 16,
   },

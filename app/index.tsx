@@ -156,7 +156,6 @@ export default function DentalAIScreen() {
       case 'ack':
         // server acknowledgements (frame acks) — ignore or surface briefly in status
         if (data.frame_count) {
-          setStatus(`📡 Ack ${data.frame_count}`);
         }
         break;
 

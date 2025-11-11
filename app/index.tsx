@@ -65,7 +65,7 @@ export default function DentalAIScreen() {
 
     Animated.timing(confidenceAnim, {
       toValue: currentPrediction.confidence,
-      duration: 500,
+      duration: 200,
       useNativeDriver: false,
     }).start();
   }, [currentPrediction, reduceMotionEnabled]);

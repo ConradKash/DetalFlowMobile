@@ -39,17 +39,24 @@ export default function DentalAIScreen() {
   const [status, setStatus] = useState('🔄 Initializing...');
   const [isConnected, setIsConnected] = useState(false);
   const [reduceMotionEnabled, setReduceMotionEnabled] = useState(false);
+  const [streamFPS, setStreamFPS] = useState(5); // Start with lower FPS
 
   const cameraRef = useRef<any>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const frameCountRef = useRef(0);
-  const captureIntervalRef = useRef<number | null>(null);
+  const captureIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const errorAlertShownRef = useRef(false);
   const confidenceAnim = useRef(new Animated.Value(0)).current;
+  const isStreamingRef = useRef(false);
+  const lastFrameTimeRef = useRef(0);
+  const isMountedRef = useRef(true);
 
   useEffect(() => {
+    isMountedRef.current = true;
     connectWebSocket();
+    
     return () => {
+      isMountedRef.current = false;
       disconnectWebSocket();
     };
   }, []);
@@ -57,7 +64,6 @@ export default function DentalAIScreen() {
   useEffect(() => {
     if (!currentPrediction) return;
 
-    // Respect OS reduced-motion accessibility setting. When enabled, jump to value instead
     if (reduceMotionEnabled) {
       confidenceAnim.setValue(currentPrediction.confidence);
       return;
@@ -70,9 +76,7 @@ export default function DentalAIScreen() {
     }).start();
   }, [currentPrediction, reduceMotionEnabled]);
 
-  // Check OS reduced motion setting and silence the dev-only Reanimated warning
   useEffect(() => {
-    // Silence the development-only Reanimated reduced-motion warning (optional)
     LogBox.ignoreLogs([
       '[Reanimated] Reduced motion setting is enabled on this device. This warning is visible only in the development mode. Some animations will be disabled by default.',
     ]);
@@ -128,9 +132,9 @@ export default function DentalAIScreen() {
   };
 
   const handleWebSocketMessage = (data: any) => {
-  const msgType = (data.type || data.action || data.msg_type || '').toString().toLowerCase();
+    const msgType = (data.type || data.action || data.msg_type || '').toString().toLowerCase();
 
-  switch (msgType) {
+    switch (msgType) {
       case 'prediction':
         const prediction: Prediction = {
           type: 'prediction',
@@ -140,7 +144,7 @@ export default function DentalAIScreen() {
         };
         
         setCurrentPrediction(prediction);
-        setChatHistory(prev => [...prev.slice(-11), prediction]); // Keep last 12 messages
+        setChatHistory(prev => [...prev.slice(-11), prediction]);
         setTotalPredictions(prev => prev + 1);
         break;
 
@@ -154,8 +158,8 @@ export default function DentalAIScreen() {
         break;
 
       case 'ack':
-        // server acknowledgements (frame acks) — ignore or surface briefly in status
         if (data.frame_count) {
+          // Handle acknowledgement
         }
         break;
 
@@ -167,14 +171,12 @@ export default function DentalAIScreen() {
           timestamp: new Date().toLocaleTimeString(),
         };
         setChatHistory(prev => [...prev.slice(-11), errMsg]);
-        // show alert only once per session to avoid repeated popups
         if (!(errorAlertShownRef.current)) {
           errorAlertShownRef.current = true;
         }
         break;
 
       default:
-        // don't spam the console for non-critical/unexpected messages; use debug for dev inspection
         console.debug('Unhandled WS message type:', msgType, data);
     }
   };
@@ -184,43 +186,92 @@ export default function DentalAIScreen() {
       wsRef.current.close();
       wsRef.current = null;
     }
-    if (captureIntervalRef.current) {
-      clearInterval(captureIntervalRef.current);
-      captureIntervalRef.current = null;
-    }
+    stopVideoStream();
   };
 
-  const captureFrame = async () => {
+  const startVideoStream = () => {
     if (!cameraRef.current || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
       return;
     }
 
-    try {
-      const photo = await cameraRef.current.takePictureAsync({
-        quality: 0.7,
-        base64: true,
-        skipProcessing: true,
-      });
+    isStreamingRef.current = true;
+    frameCountRef.current = 0;
+    lastFrameTimeRef.current = 0;
 
-      if (photo?.base64) {
-        frameCountRef.current++;
-        
-        // Send frame to WebSocket
-        wsRef.current.send(JSON.stringify({
-          frame: photo.base64,
-        }));
+    const frameInterval = 100 / streamFPS;
 
-        // Send ack message every few frames
-        if (frameCountRef.current % 5 === 0) {
+    const captureFrame = async () => {
+      // Check if component is still mounted and streaming is active
+      if (!isMountedRef.current || !isStreamingRef.current || !cameraRef.current) {
+        return;
+      }
+
+      const now = Date.now();
+      
+      // Skip frame if too soon
+      if (now - lastFrameTimeRef.current < frameInterval) {
+        return;
+      }
+
+      try {
+        const photo = await cameraRef.current.takePictureAsync({
+          quality: 0.4,
+          base64: true,
+          skipProcessing: true,
+          exif: false,
+        });
+
+        if (photo?.base64 && wsRef.current?.readyState === WebSocket.OPEN) {
+          frameCountRef.current++;
+          lastFrameTimeRef.current = now;
+          
           wsRef.current.send(JSON.stringify({
-            action: 'ack',
-            frame_count: frameCountRef.current,
+            type: 'video_frame',
+            frame: photo.base64,
+            frame_number: frameCountRef.current,
+            timestamp: now,
+            width: photo.width,
+            height: photo.height,
           }));
+
+          // Update status with frame count occasionally
+          if (frameCountRef.current % 15 === 0) {
+            setStatus(`🎥 Streaming (${streamFPS} FPS) - ${frameCountRef.current} frames`);
+          }
+
+          // Send ack every 10 frames
+          if (frameCountRef.current % 10 === 0) {
+            wsRef.current.send(JSON.stringify({
+              action: 'ack',
+              frame_count: frameCountRef.current,
+              fps: streamFPS,
+            }));
+          }
+        }
+      } catch (error: any) {
+        // Only log errors that aren't "camera unmounted" during shutdown
+        if (isMountedRef.current && isStreamingRef.current) {
+          console.log('Frame capture skipped:', error.message);
         }
       }
-    } catch (error) {
-      console.error('Error capturing frame:', error);
+    };
+
+    // Clear any existing interval
+    if (captureIntervalRef.current) {
+      clearInterval(captureIntervalRef.current);
     }
+
+    // Start new interval - use slightly faster interval for better timing
+    captureIntervalRef.current = setInterval(captureFrame, frameInterval / 2);
+  };
+
+  const stopVideoStream = () => {
+    isStreamingRef.current = false;
+    if (captureIntervalRef.current) {
+      clearInterval(captureIntervalRef.current);
+      captureIntervalRef.current = null;
+    }
+    lastFrameTimeRef.current = 0;
   };
 
   const startAnalysis = () => {
@@ -231,16 +282,18 @@ export default function DentalAIScreen() {
     }
 
     setAnalysisActive(true);
-    setStatus('🔍 Analyzing Live Video...');
+    setStatus(`🎥 Starting Video Stream (${streamFPS} FPS)...`);
     setCurrentPrediction(null);
 
-    // Start capturing frames every 500ms
-    captureIntervalRef.current = setInterval(captureFrame, 500);
+    // Small delay to ensure state is updated
+    setTimeout(() => {
+      startVideoStream();
+    }, 100);
 
-    // Send start command to WebSocket
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({
-        action: 'start',
+        action: 'start_video_stream',
+        target_fps: streamFPS,
         predict_every_frames: 1,
       }));
     }
@@ -251,14 +304,28 @@ export default function DentalAIScreen() {
     setStatus('⏸️ Ready for Analysis');
     setCurrentPrediction(null);
 
-    if (captureIntervalRef.current) {
-      clearInterval(captureIntervalRef.current);
-      captureIntervalRef.current = null;
-    }
+    stopVideoStream();
 
-    // Send stop command to WebSocket
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ action: 'stop' }));
+      wsRef.current.send(JSON.stringify({ action: 'stop_video_stream' }));
+    }
+  };
+
+  const toggleStreamFPS = () => {
+    const fpsOptions = [3, 5, 8, 10]; // More conservative FPS options
+    const currentIndex = fpsOptions.indexOf(streamFPS);
+    const nextIndex = (currentIndex + 1) % fpsOptions.length;
+    const newFPS = fpsOptions[nextIndex];
+    
+    setStreamFPS(newFPS);
+    
+    if (analysisActive) {
+      setStatus(`🔄 Switching to ${newFPS} FPS...`);
+      stopVideoStream();
+      setTimeout(() => {
+        startVideoStream();
+        setStatus(`🎥 Streaming Video (${newFPS} FPS)...`);
+      }, 200);
     }
   };
 
@@ -305,7 +372,8 @@ export default function DentalAIScreen() {
   return (
     <View style={styles.container}>
       <View style={styles.header}>
-        <Text style={styles.title}>Dental Flow</Text>
+        <Text style={styles.title}>Dental Flow - Video Stream</Text>
+        <Text style={styles.subtitle}>Live {streamFPS} FPS Video Analysis</Text>
       </View>
 
       <ScrollView style={styles.scrollView} showsVerticalScrollIndicator={false}>
@@ -316,10 +384,9 @@ export default function DentalAIScreen() {
             ref={cameraRef}
           />
           
-          {/* Current Prediction Overlay */}
           {currentPrediction && (
             <View style={styles.predictionOverlay}>
-              <Text style={styles.overlayTitle}>Current Diagnosis</Text>
+              <Text style={styles.overlayTitle}>Live Diagnosis</Text>
               <Text style={styles.predictionText}>
                 {formatClassName(currentPrediction.predicted_class)}
               </Text>
@@ -334,19 +401,28 @@ export default function DentalAIScreen() {
                   ]} 
                 />
               </View>
+              <Text style={styles.fpsText}>
+                📹 {streamFPS} FPS • 🖼️ {frameCountRef.current} frames
+              </Text>
             </View>
           )}
 
-          {/* Camera Flip Button */}
-          <TouchableOpacity style={styles.flipButton} onPress={toggleCameraFacing}>
-            <Text style={styles.flipButtonText}>🔄 Flip</Text>
-          </TouchableOpacity>
+          <View style={styles.cameraControls}>
+            <TouchableOpacity style={styles.flipButton} onPress={toggleCameraFacing}>
+              <Text style={styles.flipButtonText}>🔄 Flip</Text>
+            </TouchableOpacity>
+            
+            <TouchableOpacity style={styles.fpsButton} onPress={toggleStreamFPS}>
+              <Text style={styles.fpsButtonText}>🎥 {streamFPS} FPS</Text>
+            </TouchableOpacity>
+          </View>
         </View>
 
-        {/* Status & Controls */}
         <View style={styles.controlsContainer}>
           <View style={[styles.statusBadge, analysisActive ? styles.statusActive : styles.statusInactive]}>
-            <Text style={styles.statusText}>{status}</Text>
+            <Text style={styles.statusText}>
+              {status}
+            </Text>
           </View>
 
           <View style={styles.buttonRow}>
@@ -359,7 +435,7 @@ export default function DentalAIScreen() {
               onPress={startAnalysis}
               disabled={analysisActive}
             >
-              <Text style={styles.controlButtonText}>▶ Start Analysis</Text>
+              <Text style={styles.controlButtonText}>🎥 Start Video Stream</Text>
             </TouchableOpacity>
 
             <TouchableOpacity
@@ -371,14 +447,13 @@ export default function DentalAIScreen() {
               onPress={stopAnalysis}
               disabled={!analysisActive}
             >
-              <Text style={styles.controlButtonText}>⏹ Stop</Text>
+              <Text style={styles.controlButtonText}>⏹ Stop Stream</Text>
             </TouchableOpacity>
           </View>
         </View>
 
-        {/* Stats Card */}
         <View style={styles.statsCard}>
-          <Text style={styles.statsTitle}>📊 Live Stats</Text>
+          <Text style={styles.statsTitle}>📊 Live Video Stats</Text>
           <View style={styles.statsRow}>
             <View style={styles.statItem}>
               <Text style={styles.statValue}>
@@ -387,15 +462,16 @@ export default function DentalAIScreen() {
               <Text style={styles.statLabel}>Current</Text>
             </View>
             <View style={styles.statItem}>
-              <Text style={styles.statValue}>
-                {currentPrediction ? `${(currentPrediction.confidence * 100).toFixed(1)}%` : '--'}
-              </Text>
-              <Text style={styles.statLabel}>Confidence</Text>
+              <Text style={styles.statValue}>{streamFPS}</Text>
+              <Text style={styles.statLabel}>FPS</Text>
+            </View>
+            <View style={styles.statItem}>
+              <Text style={styles.statValue}>{frameCountRef.current}</Text>
+              <Text style={styles.statLabel}>Frames</Text>
             </View>
           </View>
         </View>
 
-        {/* Chat History */}
         <View style={styles.chatContainer}>
           <View style={styles.chatHeader}>
             <Text style={styles.chatTitle}>📋 Diagnosis History</Text>
@@ -441,7 +517,7 @@ export default function DentalAIScreen() {
                       </Text>
                     </>
                   ) : (
-                    <></>
+                    <Text style={styles.systemMessageText}>{message.message}</Text>
                   )}
                 </View>
               ))
@@ -449,14 +525,13 @@ export default function DentalAIScreen() {
           </ScrollView>
         </View>
 
-        {/* Information Section */}
         <View style={styles.infoContainer}>
           <Text style={styles.infoTitle}>💡 Tips for Best Results</Text>
           <Text style={styles.infoText}>
             • Ensure good lighting{"\n"}
             • Focus on specific areas{"\n"}
             • Keep camera steady{"\n"}
-            • Move slowly for best results{"\n"}
+            • Lower FPS for better stability{"\n"}
             • Start/stop as needed
           </Text>
         </View>
@@ -474,7 +549,7 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   header: {
-    backgroundColor: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+    backgroundColor: 'rgba(102, 126, 234, 1)',
     paddingVertical: 20,
     paddingHorizontal: 16,
     borderBottomLeftRadius: 20,
@@ -488,8 +563,8 @@ const styles = StyleSheet.create({
     textAlign: 'center',
   },
   subtitle: {
-    fontSize: 16,
-    color: 'rgba(191, 32, 32, 0.9)',
+    fontSize: 14,
+    color: 'rgba(255, 255, 255, 0.9)',
     textAlign: 'center',
     marginTop: 4,
   },
@@ -547,10 +622,14 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(255,255,255,0.9)',
     borderRadius: 3,
   },
-  flipButton: {
+  cameraControls: {
     position: 'absolute',
     bottom: 16,
     right: 16,
+    flexDirection: 'row',
+    gap: 8,
+  },
+  flipButton: {
     backgroundColor: 'rgba(0,0,0,0.7)',
     paddingHorizontal: 12,
     paddingVertical: 8,
@@ -559,6 +638,23 @@ const styles = StyleSheet.create({
   flipButtonText: {
     color: 'white',
     fontWeight: '600',
+    fontSize: 12,
+  },
+  fpsButton: {
+    backgroundColor: 'rgba(0,0,0,0.7)',
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 20,
+  },
+  fpsButtonText: {
+    color: 'white',
+    fontWeight: '600',
+    fontSize: 12,
+  },
+  fpsText: {
+    color: 'rgba(255,255,255,0.8)',
+    fontSize: 12,
+    marginTop: 4,
   },
   controlsContainer: {
     margin: 16,
@@ -606,7 +702,7 @@ const styles = StyleSheet.create({
     fontSize: 16,
   },
   statsCard: {
-    backgroundColor: 'linear-gradient(135deg, #f093fb 0%, #f5576c 100%)',
+    backgroundColor: 'rgba(240, 147, 251, 1)',
     margin: 16,
     padding: 20,
     borderRadius: 16,
@@ -637,14 +733,9 @@ const styles = StyleSheet.create({
   },
   chatContainer: {
     margin: 16,
-    backgroundColor: '#16a855ff',
+    backgroundColor: '#16a855',
     borderRadius: 16,
     padding: 16,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.1,
-    shadowRadius: 8,
-    elevation: 3,
   },
   chatHeader: {
     flexDirection: 'row',
@@ -670,10 +761,10 @@ const styles = StyleSheet.create({
     marginBottom: 12,
   },
   predictionMessage: {
-    backgroundColor: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+    backgroundColor: 'rgba(102, 126, 234, 1)',
   },
   systemMessage: {
-    backgroundColor: '#a9b4c0ff',
+    backgroundColor: '#a9b4c0',
     borderColor: '#e9ecef',
     borderWidth: 1,
   },
@@ -708,11 +799,6 @@ const styles = StyleSheet.create({
     backgroundColor: 'white',
     borderRadius: 16,
     padding: 20,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.1,
-    shadowRadius: 8,
-    elevation: 3,
   },
   infoTitle: {
     fontSize: 16,
@@ -722,9 +808,8 @@ const styles = StyleSheet.create({
   },
   infoText: {
     fontSize: 14,
-    color: '#4f2828ff',
+    color: '#4f2828',
     lineHeight: 20,
-    marginBottom: 16,
   },
   button: {
     backgroundColor: '#667eea',
